@@ -1,0 +1,161 @@
+name: Test setup-conda-standalone
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  # Concurrency group that uses the workflow name and PR number if available
+  # or commit SHA as a fallback. If a new build is triggered under that
+  # concurrency group while a previous build is running it will be canceled.
+  # Repeated pushes to a PR will cancel all previous builds, while multiple
+  # merges to main will not cancel.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1  # v4.3.0
+        with:
+          cache: true
+          run_install: true
+
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+        with:
+          extra_args: --all-files --hook-stage pre-commit --hook-stage pre-push
+
+
+  unit-test:
+    name: Run unit tests
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-latest
+          - macos-26-intel
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - windows-latest
+          - windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1  # v4.3.0
+        with:
+          cache: true
+          run_install: true
+
+      - name: Run unit tests
+        run: pnpm test
+
+      - name: Check coverage
+        run: |
+          COVERAGE=$(jq '.total | [.[].pct] | min' coverage/coverage-summary.json)
+          if ! [[ ${COVERAGE} -eq 100 ]]; then
+            echo "::error::Coverage is not 100% (currently: ${COVERAGE}%)."
+            exit 1
+          fi
+        shell: bash
+
+
+  integration-test:
+    name: Run integration tests
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - single
+          - onedir
+        runner:
+          - macos-latest
+          - macos-26-intel
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          # TODO: add windows-11-arm once win-arm64 packages are available
+          - windows-latest
+        set-env:
+          - 'true'
+          - 'false'
+        exclude:
+          - build: single
+            set-env: 'false'
+          - build: onedir
+            set-env: 'true'
+    runs-on: ${{ matrix.runner }}
+    env:
+      BUILD_VARIANT: ${{ matrix.build }}
+      # This is the only version available on all platforms
+      # for both build variants
+      CONDA_STANDALONE_VERSION: 25.5.1.post1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup conda-standalone
+        id: setup
+        uses: ./
+        with:
+          build-string: '*${{ env.BUILD_VARIANT }}*'
+          channel: main
+          conda-standalone-version: ${{ env.CONDA_STANDALONE_VERSION }}
+          destination-directory: ${{ runner.temp }}/conda_standalone
+          set-env: ${{ matrix.set-env }}
+
+      - name: Run integration tests
+        env:
+          CONDA_EXE_OUTPUT: ${{ steps.setup.outputs.conda-standalone-path }}
+        run: |
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          assert os.environ.get("CONDA_EXE") or os.environ.get("CONDA_EXE_OUTPUT")
+
+          conda_exe_env = os.environ.get("CONDA_EXE")
+          is_onedir = os.environ.get("BUILD_VARIANT") == "onedir"
+          assert (conda_exe_env is None) == is_onedir
+
+          conda_exe = Path(conda_exe_env or os.environ.get("CONDA_EXE_OUTPUT"))
+          internal_dir = conda_exe.parent / "_internal"
+          assert conda_exe.is_file()
+          assert internal_dir.is_dir() == is_onedir
+
+          proc = subprocess.run(
+              [conda_exe, "info", "--json"],
+              check=True,
+              text=True,
+              capture_output=True,
+          )
+          assert not proc.stderr
+          assert proc.returncode == 0
+          info_output = json.loads(proc.stdout)
+          conda_standalone_version = os.environ.get("CONDA_STANDALONE_VERSION")
+          conda_version = ".".join(conda_standalone_version.split(".")[:3])
+          assert info_output.get("conda_version") == conda_version
+        shell: python
